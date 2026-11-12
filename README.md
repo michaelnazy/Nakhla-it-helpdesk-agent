@@ -206,3 +206,130 @@ python evals/run_evals.py --app http://127.0.0.1:8000
 10/10 cases passed without the optional LLM judge.
 
 The simulated helpdesk files under `services/` remain unchanged.
+
+<!-- NAKHLA_V2_AGENT_README_START -->
+
+---
+
+# Nakhla IT Helpdesk Agent — v2 implementation
+
+> **Project implementation (separate from the supplied JHF course kit above).**
+> The project is a **local-only educational agent**, not a production helpdesk or an authenticated enterprise service.
+> `v1` remains the original submitted baseline; the improvements are on `v2-improvements`.
+
+The agent uses **FastAPI + LangGraph + OpenRouter + RAG + MCP** to answer IT questions from approved Nakhla knowledge-base documents, read verified ticket history, enforce company-specific rules, and prepare ticket drafts. **Creating a ticket requires a separate human approval request**; an LLM cannot directly call a write tool.
+
+## What this implementation does
+
+- Routes eligible messages through a **validated LLM triage** and **conditional LangGraph nodes** when `V2_LIVE_GRAPH=1`.
+- Retrieves answer evidence from the approved KB; supports exact errors, free-text semantic search, source-validated fallback, and safe abstention when evidence is insufficient.
+- Enforces high-priority policies **before model-selected execution** (e.g. contractor VPN restrictions, restricted MFA methods, VIP and multiple-user priorities, security escalations).
+- Uses MCP read tools for employee directory, current incidents, and user-owned tickets; leaves verified VPN/error-code paths on a tested legacy fallback when required.
+- Returns `pending_action` for a requested ticket; `POST /api/approve` is the only route that can call MCP `create_ticket`, using the draft's `action_id` as idempotency key. Repeated approval of the same action returns its cached result without a second write.
+
+**Limitations:** Some incident and policy decisions still use deterministic Python rules and legacy routing; this is an incremental graph migration, not fully model-driven orchestration. Session state and approval replay are in memory. The local evaluator trusts a caller-supplied employee email after directory lookup; that is **not authentication**. Do not expose port 8000 or Gradio publicly.
+
+## Local quickstart — Windows PowerShell
+
+Requires Python 3.12, the provided `dataset/` and `services/` folders, plus access to OpenRouter. Run each server in a separate terminal **from the repository root**.
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env  # only on first setup; then set your local OPENROUTER_API_KEY
+```
+
+Keep `.env` private and out of Git. The `HELPDESK_API_KEY` and `HELPDESK_API_URL` must match between the simulated API and MCP. The submitted `rag_store/chunks.json` is source metadata; **if `rag_store/vectors.npz` is missing**, regenerate embeddings with:
+
+```powershell
+python build_vector_store.py
+```
+
+This may contact the configured embedding provider and use paid tokens. Start services:
+
+**Terminal 1 — simulated helpdesk:**
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m uvicorn services.helpdesk_api:app --host 127.0.0.1 --port 8102
+```
+
+**Terminal 2 — agent API (safe default, no ticket writes):**
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+$env:V2_LIVE_GRAPH = "1"
+$env:EVAL_ENABLE_WRITES = "0"
+python -m uvicorn agent_backend:app --host 127.0.0.1 --port 8000
+```
+
+**Terminal 3 — smoke check / optional UI:**
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python check_kit.py
+# or run UI separately: python ui/app_ui.py
+```
+
+Test the local `/api/chat` endpoint:
+
+```powershell
+$body = @{
+  session_id = "demo-wifi-01"
+  message = "How do I set up office Wi-Fi?"
+  user = @{ email = "tariq.hamdan@nakhla.example" }
+} | ConvertTo-Json -Depth 5
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/chat" -Method Post -ContentType "application/json" -Body $body
+```
+
+Expected on the tested v2 build: citation `KB-003` and `state = langgraph_rag_answer`. The exact answer wording can vary; never treat an answer lacking grounded citations as verified.
+
+### Run the evaluations (isolated local fixture only)
+
+The evaluator **resets simulated ticket state** and tests approval flows that must write test tickets. Stop the UI and restart **only the loopback backend** with:
+
+```powershell
+$env:V2_LIVE_GRAPH = "1"
+$env:EVAL_ENABLE_WRITES = "1"  # TEST ONLY — NEVER WITH A PUBLIC SERVER
+python -m uvicorn agent_backend:app --host 127.0.0.1 --port 8000
+```
+
+Then run in another terminal:
+
+```powershell
+python -m unittest discover -s .\tests_v2 -v
+python .\evals\run_evals.py --app http://127.0.0.1:8000 --out .\evals\scorecard.final-kit.md
+python .\evals\run_evals.py --cases .\nakhla_v2_challenge\cases.v2-challenge.jsonl --app http://127.0.0.1:8000 --out .\evals\scorecard.final-challenge.md
+python .\evals\run_evals.py --cases .\evals\cases.v2-own.jsonl --app http://127.0.0.1:8000 --out .\evals\scorecard.final-own.md
+```
+
+After tests, stop the backend (`Ctrl+C`); **restart with `EVAL_ENABLE_WRITES=0`** for normal local use. Running a second server without restarting does not change an already-loaded write flag.
+
+## Implementation files
+
+| Path | Responsibility |
+|---|---|
+| `agent_backend.py` | `/api/chat`, `/api/approve`, session state, mandatory safety flow, MCP bridge and legacy fallback |
+| `v2_triage_graph.py` | JSON/Pydantic-validated LLM triage and isolated conditional route selection |
+| `v2_live_flow.py` | LangGraph mandatory preflight, conditional routing, safe handler dispatch and fallback |
+| `v2_backend_bridge.py` | Graph handler integration for KB, policy, incidents, profile and user-owned ticket reads |
+| `v2_action_routes.py` | Explicit ticket intent check, policy/incident evidence and ticket **draft** preparation |
+| `v2_support.py` | Grounded KB selection, policy precedence, impact count, priority and topic-shift helpers |
+| `ticket_memory_router.py` | Ownership-verified ticket history/read requests |
+| `agent_graph.py`, `retrieval.py`, `ingestion.py` | Existing verified incident pipeline and semantic retrieval machinery |
+| `tests_v2/` | Consolidated versioned unit/contract tests; no live backend required |
+| `evals/cases.v2-own.jsonl`, `nakhla_v2_challenge/cases.v2-challenge.jsonl` | 14 original regression + 14 independent challenge API scenarios |
+| `DESIGN.md` and `docs/EVALUATION.md` | Architecture, safety decisions, measured results and known limitations |
+
+**Do not modify** the course-owned `services/`, `dataset/`, `evals/run_evals.py`, or `evals/cases.sample.jsonl` to improve a score.
+
+## Observed results and honest scope
+
+See [docs/EVALUATION.md](docs/EVALUATION.md) for per-run, per-suite evidence. The last reported local runs after the ticket-schema fix were **10/10 kit** and **14/14 challenge**, each with its own scorecard. The 14/14 own-case run was recorded slightly before that small schema fix. These results do **not** establish any instructor hidden-test score. The earlier instructor feedback of 35/87 applied to the prior submission and has **not** been officially regraded.
+
+The measured final kit mean turn latency was **4.28 s**, p95 **7.23 s** (slower than the earlier pre-LangGraph 2.79 s mean). The extra model call and per-call MCP subprocess startup are performance risks for future work.
+
+For design rationale, threat model, and the explicit fallback behavior, see [DESIGN.md](DESIGN.md).
+
+<!-- NAKHLA_V2_AGENT_README_END -->

@@ -32,6 +32,10 @@ from pydantic import BaseModel, Field
 # ARCHITECTURE-INTEGRATION-V1: reuse the project pipelines.
 from agent_graph import build_graph
 from retrieval import search as vector_search
+from policy_decision import decide_policy
+from v2_support import (impacted_users, priority_for, policy_first,
+                        topic_shift, choose_general_evidence, general_answer,
+                        choose_reported_error_evidence)
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent
@@ -63,6 +67,8 @@ class Session:
     turns: list[str] = field(default_factory=list)
     pending: dict | None = None
     consumed: set[str] = field(default_factory=set)
+    # NAKHLA_V2_APPROVAL_REPLAY: cached response by action_id.
+    completed_actions: dict[str, tuple[bool, Any]] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -227,14 +233,17 @@ def _draft(session: Session, subject: str, description: str, category: str, prio
         return _reply("I need your work email to look you up before preparing a ticket.", tools=tools)
     if str(employee.get("account_status", "active")).lower() not in {"active", "enabled"}:
         return _reply("This account needs manual Service Desk verification before a ticket can be proposed.", tools=tools)
+    # NAKHLA_V2_PHASE2_POLICY_RAG: enforce real KB-015 priority and impact.
+    affected = impacted_users(description)
+    priority = priority_for(priority, employee, category, affected, description)
     payload = {
-        "subject": subject[:180],
+        "subject": subject[:120],  # NAKHLA_V2_PHASE3C_SCHEMAFIX
         "description": description[:4000],
         "category": category,
         "priority": priority,
         "requester_email": employee["email"],
         "department": employee["department"],
-        "affected_users": 1,
+        "affected_users": affected,
         "attempted_steps": attempted or ["Reported the issue to the Service Desk; no troubleshooting steps confirmed"],
         "kb_refs": [x for x in dict.fromkeys(kb_refs) if x in DOCS],
     }
@@ -323,11 +332,38 @@ async def chat(body: ChatRequest):
             logger.exception("Directory lookup failed")
             tools.append({"tool": "lookup_employee", "ok": False})
     department = (employee or {}).get("department", "")
+    # NAKHLA_V2_PHASE3B_LIVE_GRAPH_OPT_IN
+    # Default OFF until both model-routing and API regression tests pass.
+    if os.getenv("V2_LIVE_GRAPH", "0") == "1":
+        try:
+            from v2_backend_bridge import maybe_route
+            proposal = await maybe_route(msg, email, employee, session, tools, sys.modules[__name__])
+            if proposal is not None:
+                return proposal
+        except Exception:
+            logger.exception("Live LangGraph failed; falling back to the verified legacy workflow")
     # NAKHLA_MCP_TICKET_ROUTER_V1: read-only ticket intents before stale issue routing.
     from ticket_memory_router import handle_ticket_query
     routed = await handle_ticket_query(msg, email, employee, session, tools, mcp_call, _reply)
     if routed is not None:
         return routed
+    # NAKHLA_V2_PHASE2_POLICY_RAG: mandatory policy check on the live path.
+    policy_decision = decide_policy(msg, department=department,
+                                    affected_users=impacted_users(msg))
+    override = policy_first(msg, employee)
+    if override is not None:
+        session.last_error, session.last_category = "", ""
+        session.turns.clear()
+        refs = [ref for ref in override["refs"] if ref in DOCS]
+        if override["kind"] == "draft":
+            return _draft(session, override["subject"], override["description"],
+                          override["category"], override["priority"], employee,
+                          refs, override["attempted"], tools)
+        return _reply(override["text"], refs, tools=tools, workflow="policy_enforced")
+    if not code_match and topic_shift(msg, code):
+        code = ""
+        session.last_error, session.last_category = "", ""
+        session.turns.clear()
     lower = msg.lower()
     # Answer employee profile questions without reusing an old issue.
     profile_question = (
@@ -363,7 +399,8 @@ async def chat(body: ChatRequest):
     # An ambiguous request must be clarified, not escalated and not sourced.
     if vpn and not code and not email:
         return _reply("Please share your work email and the VPN error code (such as NX-112 or NX-503), and tell me what happens when you connect.", tools=tools, workflow="needs_clarification")
-    if vpn and not code:
+    # Finance VPN is an immediate security escalation even without a code.
+    if vpn and not code and str(department).lower() != "finance":
         return _reply("What exact VPN error code (NX-...) do you see? Please also describe the symptoms.", tools=tools, workflow="needs_clarification")
 
     # LangGraph is the primary decision path for the demonstrated active VPN incident.
@@ -430,12 +467,12 @@ async def chat(body: ChatRequest):
     finance = vpn and str(department).lower() == "finance"
     if finance:
         refs = [x for x in ("KB-016", "KB-002") if x in DOCS]
-        if re.search(r"\b(ticket|escalat|security|need help|not working|fail|shows)\b", lower):
+        if re.search(r"\b(ticket|escalate|escalation|security|need help|not working|fail|shows|can.t connect|blocked)\b", lower) or not code:
             return _draft(
                 session,
                 f"Finance VPN access: {code or 'connection failure'}",
                 f"Finance user reports: {msg}. Follow Security Operations procedure; do not suggest generic VPN workarounds.",
-                "security", "P2", employee, refs,
+                "security", (policy_decision.get("proposed_ticket") or {}).get("priority", "P2"), employee, refs,
                 ["Reported Finance VPN access failure; referred to Security Operations"], tools,
             )
         return _reply("Finance VPN must be handled by Security Operations. Do not switch gateways or use general VPN troubleshooting.", refs, tools=tools)
@@ -464,6 +501,14 @@ async def chat(body: ChatRequest):
         refs = [doc["id"]] if doc else []
         if vpn:
             cat, priority = "network_access", "P2"
+        # NAKHLA_V2_PHASE2C_SECURITY_ROUTING: categories from KB-015.
+        # Wi-Fi outage is network access, not a generic Other issue.
+        elif re.search(r"\b(?:wi-?fi|wireless|wlan|ethernet|network|internet|vdi)\b", lower):
+            cat, priority = "network_access", "P2" if re.search(r"\b(?:cannot|can.t|unable|down|outage|blocked|stopped|offline|not working)\b", lower) else "P3"
+        elif re.search(r"\b(?:outlook|mailbox|email|e-mail|calendar|mail)\b", lower):
+            cat, priority = "email_collab", "P3"
+        elif re.search(r"\b(?:nakhlakey|password|nakhlaid|sso|login|signin|account)\b", lower):
+            cat, priority = "identity_access", "P3"
         elif "dock" in lower or "monitor" in lower or "hardware" in lower:
             cat, priority = "hardware", "P3"
         elif "software" in lower or "install" in lower or code.startswith("SWC-"):
@@ -491,7 +536,23 @@ async def chat(body: ChatRequest):
             [doc["id"]], tools=tools,
         )
 
-    return _reply("I need a little more detail: which application, what error code or symptoms, and your work email? I will check the current approved knowledge base before recommending steps.", tools=tools, workflow="needs_clarification")
+    # General RAG: search without requiring an explicit error code.
+    if not code:
+        # NAKHLA_V2_PHASE2B: first match quoted error text against current
+        # authoritative KB (e.g. code-free app-assignment error).
+        reported = choose_reported_error_evidence(msg, DOCS)
+        if reported is not None:
+            answer, refs = general_answer(reported)
+            return _reply(answer, refs, tools=tools, workflow="rag_answer")
+        try:
+            retrieved = await asyncio.to_thread(vector_search, msg, top_k=5)
+        except Exception:
+            logger.exception("General KB retrieval failed")
+            return _reply("The approved knowledge base is temporarily unavailable. I cannot verify a fix right now. Please contact the Service Desk or ask for a ticket draft.", tools=tools, workflow="retrieval_unavailable")
+        evidence = choose_general_evidence(msg, retrieved, DOCS)
+        answer, refs = general_answer(evidence)
+        return _reply(answer, refs, tools=tools, workflow="rag_answer" if refs else "unknown")
+    return _reply("Please describe the current issue and any error code. I will check the current approved knowledge base.", tools=tools, workflow="needs_clarification")
 
 
 
@@ -523,16 +584,32 @@ async def approve(body: ApproveRequest):
     async with session.lock:
         pending = session.pending
         if pending is None or pending.get("action_id") != body.action_id:
+            # A double click is a replay, not a second ticket request. Return
+            # the EXACT saved outcome for the same decision, without MCP writes.
+            previous = session.completed_actions.get(body.action_id)
+            if previous is not None and previous[0] == body.approved:
+                return previous[1]
             return JSONResponse(status_code=409, content={"reply": "That draft is no longer pending or does not match this session.", "pending_action": None})
-        session.pending = None  # One-time approval token is consumed immediately.
+
+        # The lock and one-time token guarantee a single MCP write per action_id.
+        session.pending = None
         session.consumed.add(body.action_id)
+
+        def remember(response):
+            # Cache successes, rejection, 403 and tool failures equally so a
+            # repeated click never creates another ticket or changes outcomes.
+            session.completed_actions[body.action_id] = (body.approved, response)
+            if len(session.completed_actions) > 64:
+                session.completed_actions.pop(next(iter(session.completed_actions)))
+            return response
+
         if not body.approved:
-            return _reply("Ticket request rejected. No ticket was created.", workflow="rejected")
+            return remember(_reply("Ticket request rejected. No ticket was created.", workflow="rejected"))
         if not WRITE_ENABLED:
-            return JSONResponse(status_code=403, content={
+            return remember(JSONResponse(status_code=403, content={
                 "reply": "Ticket creation is disabled. Set EVAL_ENABLE_WRITES=1 only in the isolated course evaluation process.",
                 "pending_action": None,
-            })
+            }))
         payload = pending["payload"]
         try:
             result = await mcp_call("create_ticket", {
@@ -544,11 +621,9 @@ async def approve(body: ApproveRequest):
         tool_calls = [{"tool": "create_ticket", "ok": bool(result.get("ok"))}]
         ticket_id = _created_ticket_id(result)
         if ticket_id:
-            return _reply(f"Ticket created successfully: {ticket_id}", tools=tool_calls,
-                          result={"ticket_id": ticket_id}, workflow="created")
+            return remember(_reply(f"Ticket created successfully: {ticket_id}", tools=tool_calls,
+                          result={"ticket_id": ticket_id}, workflow="created"))
 
-        # Log just error metadata to distinguish API validation from an
-        # unexpected MCP response shape; never fabricate a ticket ID.
         error_details = result.get("error") if isinstance(result, dict) else None
         code = (error_details or {}).get("code", "unexpected_mcp_response") if isinstance(error_details, dict) else "unexpected_mcp_response"
         logger.warning(
@@ -558,5 +633,5 @@ async def approve(body: ApproveRequest):
             {k: error_details.get(k) for k in ("code", "fields") if k in error_details}
             if isinstance(error_details, dict) else None,
         )
-        return _reply(f"Ticket creation failed ({code}). No ticket ID is available. Please contact the Service Desk.",
-                      tools=tool_calls, workflow="create_failed")
+        return remember(_reply(f"Ticket creation failed ({code}). No ticket ID is available. Please contact the Service Desk.",
+                      tools=tool_calls, workflow="create_failed"))

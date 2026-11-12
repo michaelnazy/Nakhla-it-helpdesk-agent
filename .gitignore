@@ -18,3 +18,16 @@ chroma_db/
 .idea/
 .DS_Store
 Thumbs.db
+
+.demo_users.json
+
+ui/app_ui.py.before_multiuser_history.bak
+
+# Local backups
+*.bak
+
+# Local certificates and keys
+.gradio/*.pem
+
+# Local demo user data
+.demo_users.json

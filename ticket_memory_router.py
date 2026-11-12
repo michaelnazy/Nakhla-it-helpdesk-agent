@@ -26,6 +26,17 @@ def _classify(message: str) -> tuple[str, str | None]:
     ):
         return ("details", tid.group(0).upper())
 
+    # NAKHLA_V2_PHASE2C_SECURITY_ROUTING: creation verbs + descriptive ticket type.
+    # A request to OPEN a NEW security/network/etc ticket must not be interpreted
+    # as a request to list the employee's already-open tickets.
+    # "What are my open tickets?" remains a read (no create verb + article).
+    if re.search(r"\b(?:open|create|raise|submit|file|log|start)\s+(?:(?:me|for me)\s+)?(?:a|an|new|another)\b.{0,65}\bticket\b", q):
+        return ("", None)
+    if re.search(r"\b(?:create|raise|submit|file|log)\s+(?:a\s+)?(?:support|security|network|vpn|software|hardware)?\s*ticket\b", q):
+        return ("", None)
+    if re.search(r"\bopen\s+(?:support|security|network|vpn|software|hardware)\s+ticket\b", q):
+        return ("", None)
+
     # Do not steal requests to CREATE a ticket. E.g. "Please open a support ticket".
     if re.search(r"\b(?:open|create|raise|submit|file)\s+(?:a|an|new|support|another)\s+(?:support\s+)?ticket\b", q):
         return ("", None)
