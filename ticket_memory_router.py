@@ -197,15 +197,24 @@ async def handle_ticket_query(message, email, employee, session, tools, mcp_call
         return answer("Ticket history is unavailable for this account.")
 
     async def tool_call(name: str, args: dict) -> Any:
+        result = None
         try:
             result = await mcp_call(name, args)
             # Treat error envelopes as failures even if tool transport succeeded.
             if isinstance(result, dict) and (result.get("ok") is False or result.get("error")):
                 raise RuntimeError("tool error")
-            tools.append({"tool": name, "ok": True})
+            call = {"tool": name, "ok": True}
+            if isinstance(result.get("_ms"), (int, float)) and result["_ms"] > 0:
+                call["ms"] = result["_ms"]
+            tools.append(call)
             return result
         except Exception:
-            tools.append({"tool": name, "ok": False})
+            call = {"tool": name, "ok": False}
+            if (isinstance(result, dict)
+                    and isinstance(result.get("_ms"), (int, float))
+                    and result["_ms"] > 0):
+                call["ms"] = result["_ms"]
+            tools.append(call)
             raise
 
     async def owned_ticket(tid: str) -> dict:

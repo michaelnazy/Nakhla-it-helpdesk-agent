@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import sys
+import time
 from dataclasses import dataclass, field
 from ipaddress import ip_address
 from pathlib import Path
@@ -101,15 +102,32 @@ def _mcp_text(result: Any) -> dict:
 
 
 async def mcp_call(tool: str, args: dict | None = None) -> dict:
+    started = time.perf_counter()
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "services.helpdesk_mcp"],
         env=os.environ.copy(),
     )
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as client:
-            await client.initialize()
-            return _mcp_text(await client.call_tool(tool, arguments=args or {}))
+    try:
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as client:
+                await client.initialize()
+                result = _mcp_text(await client.call_tool(tool, arguments=args or {}))
+    except Exception:
+        elapsed_ms = max(round((time.perf_counter() - started) * 1000, 2), 0.01)
+        logger.exception("mcp_tool_call_failed tool=%s ms=%s", tool, elapsed_ms)
+        raise
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    logger.info("mcp_tool_call tool=%s ok=%s ms=%s", tool, result.get("ok"), elapsed_ms)
+    result["_ms"] = elapsed_ms
+    return result
+
+
+def _record_tool_call(tools: list[dict], tool: str, result: dict) -> None:
+    call = {"tool": tool, "ok": bool(result.get("ok"))}
+    if isinstance(result.get("_ms"), (int, float)) and result["_ms"] > 0:
+        call["ms"] = result["_ms"]
+    tools.append(call)
 
 
 def _source(path: Path) -> dict | None:
@@ -322,7 +340,7 @@ async def chat(body: ChatRequest):
     if email:
         try:
             found = await mcp_call("lookup_employee", {"email": email})
-            tools.append({"tool": "lookup_employee", "ok": bool(found.get("ok"))})
+            _record_tool_call(tools, "lookup_employee", found)
             employee = found.get("employee") if found.get("ok") else None
             if isinstance(employee, dict) and employee.get("email", "").lower() == email:
                 session.email = email
@@ -330,7 +348,7 @@ async def chat(body: ChatRequest):
                 employee = None
         except Exception:
             logger.exception("Directory lookup failed")
-            tools.append({"tool": "lookup_employee", "ok": False})
+            _record_tool_call(tools, "lookup_employee", {"ok": False})
     department = (employee or {}).get("department", "")
     # NAKHLA_V2_PHASE3B_LIVE_GRAPH_OPT_IN
     # Default OFF until both model-routing and API regression tests pass.
@@ -422,7 +440,7 @@ async def chat(body: ChatRequest):
                 and verified.get("passed") is True
                 and "INC-2207" in (graph_state.get("source_refs") or [])
             ):
-                tools.append({"tool": "get_service_status", "ok": True})
+                _record_tool_call(tools, "get_service_status", {"ok": True})
                 return _reply(
                     graph_state["cited_answer"], graph_state["source_refs"],
                     tools=tools, workflow="langgraph_verified_incident",
@@ -433,11 +451,11 @@ async def chat(body: ChatRequest):
     if vpn or "outage" in lower or "down" in lower:
         try:
             status = await mcp_call("get_service_status")
-            tools.append({"tool": "get_service_status", "ok": bool(status.get("ok"))})
+            _record_tool_call(tools, "get_service_status", status)
         except Exception:
             logger.exception("Service status lookup failed")
             status = {"ok": False}
-            tools.append({"tool": "get_service_status", "ok": False})
+            _record_tool_call(tools, "get_service_status", {"ok": False})
         if not status.get("ok"):
             return _reply("I cannot verify the current service status. Please contact the Service Desk before changing VPN settings.", tools=tools, workflow="needs_verification")
         snapshot = status.get("status") or {}
@@ -618,7 +636,10 @@ async def approve(body: ApproveRequest):
         except Exception:
             logger.exception("Failed to call create_ticket")
             result = {"ok": False, "error": {"code": "tool_unavailable"}}
-        tool_calls = [{"tool": "create_ticket", "ok": bool(result.get("ok"))}]
+        tool_call = {"tool": "create_ticket", "ok": bool(result.get("ok"))}
+        if isinstance(result.get("_ms"), (int, float)) and result["_ms"] > 0:
+            tool_call["ms"] = result["_ms"]
+        tool_calls = [tool_call]
         ticket_id = _created_ticket_id(result)
         if ticket_id:
             return remember(_reply(f"Ticket created successfully: {ticket_id}", tools=tool_calls,

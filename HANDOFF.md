@@ -10,16 +10,15 @@ Project: Nakhla IT Helpdesk Agent
 - Multi-user demo login
 - MCP ticket history and ticket details
 
-## Known issue
-Ticket history isolation in the Gradio UI is not fully fixed.
-Sara sometimes sees Tariq's IT-1002 in the ticket list,
-although direct MCP ownership checks return the correct records.
+## Verification note
+Ticket history ownership is checked in `ticket_memory_router.py`. Direct API
+ownership tests cover Sara seeing IT-1021 and not seeing Tariq's IT-1002.
+The Gradio UI isolation issue has not been fully resolved: Sara may still see
+Tariq's IT-1002 in the UI ticket list even though direct MCP ownership checks
+return the correct records.
 
-Expected:
-- Tariq: IT-1002
-- Sara: IT-1021
-
-Do not expose this demo publicly until the isolation issue is fixed.
+This remains a local educational demo and must not be exposed publicly because
+the supplied email is not authentication.
 
 ## Important
 - Never commit .env or demo user credentials.

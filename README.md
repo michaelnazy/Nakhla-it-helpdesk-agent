@@ -28,7 +28,7 @@ python dataset/validate_dataset.py                      # optional: dataset cons
 ```
 
 macOS/Linux: `python3.12 -m venv .venv`, `source .venv/bin/activate`, `cp .env.example .env`.
-Docker instead of uvicorn: `docker compose up --build` (same API on port 8102).
+Docker instead of uvicorn: `docker compose up --build` (simulated API on 8102 and agent on 8000).
 
 One venv is enough for the kit **and** your agent: `requirements.txt` also pins the course's agent
 framework (`langgraph==1.2.10`, `openai==2.52.0`) and `mcp==1.28.1`, the MCP version CrewAI 1.15 needs.
@@ -203,7 +203,10 @@ python evals/run_evals.py --app http://127.0.0.1:8000
 
 ### Sample evaluation result
 
-10/10 cases passed without the optional LLM judge.
+The current local evidence is recorded in [evals/scorecard.final-kit.md](evals/scorecard.final-kit.md),
+[evals/scorecard.final-challenge.md](evals/scorecard.final-challenge.md), and
+[evals/scorecard.phase3c-own.md](evals/scorecard.phase3c-own.md):
+10/10 kit cases, 14/14 challenge cases, and 14/14 independently authored cases.
 
 The simulated helpdesk files under `services/` remain unchanged.
 
